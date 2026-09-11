@@ -1,152 +1,128 @@
 """
-Bot WhatsApp PPDB - PKBM Tunas Harapan
-=======================================
+Bot WhatsApp PPDB - PKBM Tunas Harapan (versi CADANGAN, tanpa AI)
+==================================================================
 
-Server webhook untuk WhatsApp Cloud API (Meta) yang menjawab pertanyaan calon
-peserta didik/orang tua seputar PPDB secara percakapan natural, memakai Claude
-(Anthropic API) sebagai "otak" bot.
+Versi ini TIDAK memakai Claude/AI apa pun -- semua balasan dicocokkan lewat
+kata kunci (rule-based), jadi 100% GRATIS untuk dijalankan (tidak ada biaya
+per pesan sama sekali). Cocok sebagai cadangan kalau bot versi AI (app.py di
+folder pkbm-whatsapp-bot) sedang bermasalah, atau kalau memang tidak mau ada
+biaya berlangganan sama sekali.
 
-Cara kerja singkat:
-1. Meta mengirim GET ke /webhook saat verifikasi awal -> kita cocokkan VERIFY_TOKEN.
-2. Meta mengirim POST ke /webhook setiap ada pesan WhatsApp masuk.
-3. Kita ambil teks pesan, kirim ke Claude bersama info PPDB (lihat PPDB_INFO di
-   bawah) supaya jawabannya akurat, lalu kirim balasan Claude itu balik ke
-   pengirim lewat WhatsApp Cloud API.
+Cara kerja: setiap pesan masuk dicek kata kuncinya (jadwal, syarat, biaya,
+dst) lalu dibalas dengan jawaban yang sudah disiapkan di bagian JAWABAN di
+bawah. Kalau tidak ada kata kunci yang cocok, bot menampilkan menu topik
+yang bisa ditanyakan.
 
-Semua nilai rahasia (token WhatsApp, verify token, API key Claude) DIAMBIL DARI
-ENVIRONMENT VARIABLE, bukan ditulis langsung di kode ini -- supaya aman dan
-gampang diganti dari dashboard hosting tanpa deploy ulang.
+Edit teks jawaban di bagian bawah kapan saja tanpa perlu paham kode.
 """
 
 import os
-import time
 import logging
 
 from flask import Flask, request, jsonify
 import requests
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("pkbm-bot")
+log = logging.getLogger("pkbm-bot-no-ai")
 
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# 1) INFORMASI PPDB -- EDIT BAGIAN INI KAPAN SAJA SESUAI KEBUTUHAN
-#    (tidak perlu paham kode, cukup ubah teks di dalam tanda kutip)
-# ---------------------------------------------------------------------------
-PPDB_INFO = """
-Kamu adalah admin WhatsApp resmi PKBM Tunas Harapan Cirebon yang membantu
-calon peserta didik dan orang tua/wali seputar Penerimaan Peserta Didik Baru
-(PPDB). Jawab dengan ramah, singkat, jelas, dan dalam Bahasa Indonesia yang
-sopan (gunakan sapaan "Bapak/Ibu" atau "Kakak" sesuai konteks). Jangan
-mengaku sebagai AI/model bahasa -- posisikan diri sebagai admin PKBM.
-
-INFORMASI RESMI PPDB PKBM TUNAS HARAPAN:
-
-1. Jadwal pendaftaran: Pendaftaran dibuka SEPANJANG TAHUN, terbagi 2 gelombang:
-   - Gelombang 1: Desember - Juli
-   - Gelombang 2: Agustus - November
-
-2. Program/paket yang tersedia: Paket A (setara SD), Paket B (setara SMP),
-   dan Paket C (setara SMA).
-
-3. Syarat pendaftaran (dokumen yang perlu dibawa/difotokopi):
-   - Fotokopi KTP (jika calon peserta didik sudah punya KTP); jika belum
-     punya KTP, gunakan fotokopi KTP orang tua/wali
-   - Fotokopi Kartu Keluarga (KK)
-   - Fotokopi Ijazah terakhir
-   - Rapor terakhir (dipakai untuk proses Rekognisi Pembelajaran Lampau/RPL,
-     supaya bisa lanjut dari jenjang yang sesuai)
-   - Pas foto ukuran 4x6 sebanyak 3 lembar, dan 3x4 sebanyak 3 lembar
-   - Materai Rp10.000 sebanyak 3 lembar
-
-4. Biaya: GRATIS biaya pendidikan untuk peserta didik usia sekolah/usia
-   belajar sesuai aturan pemerintah (tidak dipungut biaya).
-
-5. Alamat PKBM: Keandra Living Sampiran, Jl. Living Raya No. 63.
-
-6. Jika ada pertanyaan yang benar-benar di luar informasi di atas, atau perlu
-   ditindaklanjuti manusia (misalnya kasus khusus, komplain, atau butuh
-   konfirmasi berkas langsung), tetap jawab dengan sopan sebisamu dari
-   informasi yang kamu punya, lalu sarankan untuk lanjut ke admin di nomor
-   0852-2465-6996 kalau memang perlu penanganan langsung -- tapi jangan
-   langsung melempar ke nomor itu untuk pertanyaan umum yang sebetulnya bisa
-   kamu jawab sendiri dari info di atas.
-
-Jaga jawaban tetap ringkas (idealnya 2-5 kalimat, atau poin singkat kalau
-menjelaskan syarat/dokumen), jangan bertele-tele, dan akhiri dengan
-menawarkan bantuan lanjutan bila relevan.
-"""
-
-# ---------------------------------------------------------------------------
-# 2) KONFIGURASI DARI ENVIRONMENT VARIABLE (diisi di dashboard hosting)
+# KONFIGURASI DARI ENVIRONMENT VARIABLE (diisi di dashboard hosting)
 # ---------------------------------------------------------------------------
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 WHATSAPP_API_VERSION = os.environ.get("WHATSAPP_API_VERSION", "v21.0")
 
-# Riwayat percakapan sementara per nomor pengirim (disimpan di memori server).
-# Catatan: ini akan kosong lagi kalau server tidur/restart (wajar di hosting
-# gratis) -- untuk volume tanya-jawab PPDB harian ini biasanya tidak masalah.
-CONVERSATIONS = {}
-MAX_HISTORY_MESSAGES = 10
-CONVERSATION_TTL_SECONDS = 60 * 60 * 6  # riwayat dianggap basi setelah 6 jam
+ADMIN_NUMBER = "0852-2465-6996"
+
+# ---------------------------------------------------------------------------
+# JAWABAN -- EDIT BAGIAN INI KAPAN SAJA SESUAI KEBUTUHAN
+# ---------------------------------------------------------------------------
+JAWABAN_JADWAL = (
+    "Pendaftaran PPDB PKBM Tunas Harapan dibuka SEPANJANG TAHUN, terbagi "
+    "2 gelombang:\n"
+    "- Gelombang 1: Desember - Juli\n"
+    "- Gelombang 2: Agustus - November\n\n"
+    "Ada lagi yang mau ditanyakan (syarat, biaya, program, lokasi)?"
+)
+
+JAWABAN_SYARAT = (
+    "Berkas yang perlu disiapkan untuk mendaftar:\n"
+    "1. Fotokopi KTP (kalau belum punya KTP, pakai fotokopi KTP orang tua/wali)\n"
+    "2. Fotokopi Kartu Keluarga (KK)\n"
+    "3. Fotokopi ijazah terakhir\n"
+    "4. Rapor terakhir (untuk proses Rekognisi Pembelajaran Lampau)\n"
+    "5. Pas foto 4x6 (3 lembar) dan 3x4 (3 lembar)\n"
+    "6. Materai Rp10.000 (3 lembar)\n\n"
+    "Ada lagi yang mau ditanyakan?"
+)
+
+JAWABAN_PROGRAM = (
+    "PKBM Tunas Harapan menyediakan Paket A (setara SD), Paket B (setara "
+    "SMP), dan Paket C (setara SMA). Mau tanya soal jadwal, syarat, atau "
+    "biaya pendaftarannya?"
+)
+
+JAWABAN_BIAYA = (
+    "Pendidikan di PKBM Tunas Harapan GRATIS untuk peserta didik usia "
+    "sekolah/usia belajar sesuai aturan pemerintah, tidak dipungut biaya.\n\n"
+    "Ada lagi yang mau ditanyakan?"
+)
+
+JAWABAN_LOKASI = (
+    "Alamat PKBM Tunas Harapan: Keandra Living Sampiran, Jl. Living Raya "
+    "No. 63.\n\nAda lagi yang mau ditanyakan?"
+)
+
+JAWABAN_ADMIN = (
+    f"Baik, untuk pertanyaan ini sebaiknya langsung dibantu admin kami di "
+    f"{ADMIN_NUMBER} ya. Admin akan segera membalas."
+)
+
+JAWABAN_TERIMA_KASIH = "Sama-sama! Semoga lancar pendaftarannya. 🙏"
+
+JAWABAN_SAPAAN = (
+    "Assalamu'alaikum, selamat datang di layanan info PPDB PKBM Tunas "
+    "Harapan! 😊\n\n"
+    "Bapak/Ibu bisa tanya seputar:\n"
+    "- *Jadwal* pendaftaran\n"
+    "- *Syarat/berkas* pendaftaran\n"
+    "- *Program* (Paket A/B/C)\n"
+    "- *Biaya*\n"
+    "- *Lokasi/alamat*\n\n"
+    "Silakan ketik pertanyaannya langsung, ya."
+)
+
+JAWABAN_TIDAK_MENGERTI = (
+    "Maaf, admin belum bisa memahami pertanyaan itu secara otomatis. "
+    "Bapak/Ibu bisa tanya soal *jadwal*, *syarat*, *program*, *biaya*, "
+    "atau *lokasi* pendaftaran. Kalau butuh dibantu langsung, silakan "
+    f"hubungi admin di {ADMIN_NUMBER}."
+)
+
+# Urutan penting: kata kunci yang lebih spesifik ditaruh lebih dulu.
+# Format: (daftar kata kunci, jawaban)
+ATURAN = [
+    (["jadwal", "kapan", "buka pendaftaran", "tanggal daftar", "gelombang"], JAWABAN_JADWAL),
+    (["syarat", "berkas", "dokumen", "persyaratan", "bawa apa", "kelengkapan"], JAWABAN_SYARAT),
+    (["paket a", "paket b", "paket c", "program", "setara sd", "setara smp", "setara sma", "kejar paket"], JAWABAN_PROGRAM),
+    (["biaya", "bayar", "gratis", "spp", "harga", "uang pendaftaran"], JAWABAN_BIAYA),
+    (["alamat", "lokasi", "dimana", "di mana", "tempat"], JAWABAN_LOKASI),
+    (["admin", "cs", "manusia", "operator", "komplain", "keluhan", "bicara dengan orang"], JAWABAN_ADMIN),
+    (["terima kasih", "makasih", "thanks", "trims"], JAWABAN_TERIMA_KASIH),
+    (["halo", "hai", "assalamualaikum", "assalamu'alaikum", "permisi", "selamat pagi", "selamat siang", "selamat sore", "selamat malam"], JAWABAN_SAPAAN),
+]
 
 
-def _get_history(sender):
-    entry = CONVERSATIONS.get(sender)
-    if entry and (time.time() - entry["updated_at"]) < CONVERSATION_TTL_SECONDS:
-        return entry["messages"]
-    return []
-
-
-def _save_history(sender, messages):
-    CONVERSATIONS[sender] = {
-        "messages": messages[-MAX_HISTORY_MESSAGES:],
-        "updated_at": time.time(),
-    }
-
-
-def ask_claude(sender, user_text):
-    """Kirim pertanyaan ke Claude beserta konteks PPDB & riwayat obrolan."""
-    history = _get_history(sender)
-    messages = history + [{"role": "user", "content": user_text}]
-
-    resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": CLAUDE_MODEL,
-            "max_tokens": 500,
-            "system": PPDB_INFO,
-            "messages": messages,
-        },
-        timeout=30,
-    )
-
-    if resp.status_code != 200:
-        log.error("Anthropic API error %s: %s", resp.status_code, resp.text)
-        return (
-            "Maaf, admin sedang mengalami kendala teknis sebentar. "
-            "Silakan coba lagi beberapa saat lagi, atau hubungi 0852-2465-6996."
-        )
-
-    data = resp.json()
-    reply_text = "".join(
-        block.get("text", "") for block in data.get("content", []) if block.get("type") == "text"
-    ).strip()
-
-    messages.append({"role": "assistant", "content": reply_text})
-    _save_history(sender, messages)
-
-    return reply_text or "Maaf, bisa diulangi pertanyaannya?"
+def cari_jawaban(teks_masuk: str) -> str:
+    teks = teks_masuk.lower()
+    for kata_kunci_list, jawaban in ATURAN:
+        for kata_kunci in kata_kunci_list:
+            if kata_kunci in teks:
+                return jawaban
+    return JAWABAN_TIDAK_MENGERTI
 
 
 def send_whatsapp_message(to, text):
@@ -172,7 +148,7 @@ def send_whatsapp_message(to, text):
 
 @app.get("/")
 def health():
-    return "PKBM Tunas Harapan WhatsApp bot is running.", 200
+    return "PKBM Tunas Harapan WhatsApp bot (versi tanpa AI) is running.", 200
 
 
 @app.get("/webhook")
@@ -200,7 +176,6 @@ def receive_message():
         messages = change.get("messages")
 
         if not messages:
-            # Ini biasanya notifikasi status (terkirim/dibaca), bukan pesan baru.
             return jsonify(status="ignored"), 200
 
         message = messages[0]
@@ -214,18 +189,17 @@ def receive_message():
             user_text = (
                 interactive.get("button_reply", {}).get("title")
                 or interactive.get("list_reply", {}).get("title")
-                or "(pesan interaktif)"
+                or ""
             )
         else:
-            user_text = f"(mengirim {msg_type}, mohon dibalas dengan teks ya)"
+            user_text = ""
 
-        reply_text = ask_claude(sender, user_text)
+        reply_text = cari_jawaban(user_text) if user_text else JAWABAN_TIDAK_MENGERTI
         send_whatsapp_message(sender, reply_text)
 
     except Exception:
-        log.exception("Gagal memproses pesan masuk")
+        log.exception("Gagal memproses psan masuk")
 
-    # Selalu balas 200 ke Meta supaya tidak dianggap gagal & dikirim ulang terus.
     return jsonify(status="ok"), 200
 
 
